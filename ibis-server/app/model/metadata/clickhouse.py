@@ -8,12 +8,17 @@ from app.model.metadata.dto import (
     TableProperties,
 )
 from app.model.metadata.metadata import Metadata
+from ibis.backends.clickhouse import Backend
+import types
+importlib.import_module("app.custom_ibis.backends.clickhouse")
+from app.custom_ibis.backends.clickhouse import custom_get_schema_using_query
 
 
 class ClickHouseMetadata(Metadata):
     def __init__(self, connection_info: ClickHouseConnectionInfo):
         super().__init__(connection_info)
         self.connection = DataSource.clickhouse.get_connection(connection_info)
+        self.connection._get_schema_using_query = types.MethodType(custom_get_schema_using_query, self.connection)
 
     def get_table_list(self) -> list[Table]:
         sql = """
