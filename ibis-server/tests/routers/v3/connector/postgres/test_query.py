@@ -99,11 +99,12 @@ manifest = {
                     "name": "customer_access",
                     "requiredProperties": [
                         {
-                            "name": "session_user",
+                            # To test the name is case insensitive
+                            "name": "Session_user",
                             "required": False,
                         }
                     ],
-                    "condition": "c_name = @session_user",
+                    "condition": "c_name = @session_User",
                 },
             ],
             "primaryKey": "c_custkey",
@@ -627,6 +628,58 @@ async def test_clac_query(client, manifest_str, connection_info):
     assert len(result["data"]) == 1
     assert len(result["data"][0]) == 2
 
+    manifest_with_required_properties = {
+        "catalog": "wren",
+        "schema": "public",
+        "models": [
+            {
+                "name": "customer",
+                "tableReference": {
+                    "schema": "public",
+                    "table": "customer",
+                },
+                "columns": [
+                    {"name": "c_custkey", "type": "integer"},
+                    {
+                        "name": "c_name",
+                        "type": "varchar",
+                        "columnLevelAccessControl": {
+                            "name": "c_name_access",
+                            "requiredProperties": [
+                                {
+                                    "name": "Session_level",
+                                    "required": True,
+                                }
+                            ],
+                            "operator": "EQUALS",
+                            "threshold": "1",
+                        },
+                    },
+                ],
+                "primaryKey": "c_custkey",
+            },
+        ],
+    }
+
+    base64_manifest_with_required_properties = base64.b64encode(
+        orjson.dumps(manifest_with_required_properties)
+    ).decode("utf-8")
+    response = await client.post(
+        url=f"{base_url}/query",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": base64_manifest_with_required_properties,
+            "sql": "SELECT * FROM customer limit 1",
+        },
+        headers={
+            X_WREN_VARIABLE_PREFIX + "session_level": "2",
+        },
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert len(result["data"]) == 1
+    assert len(result["data"][0]) == 2
+
 
 async def test_connection_timeout(
     client, manifest_str, connection_info, connection_url
@@ -796,3 +849,335 @@ async def test_order_by_nulls_last(client, manifest_str, connection_info):
     assert result["data"][0][0] == "two"
     assert result["data"][1][0] == "one"
     assert result["data"][2][0] == "three"
+
+
+async def test_cache_with_different_wren_variables(
+    client, manifest_str, connection_info
+):
+    response1 = await client.post(
+        url=f"{base_url}/query?cacheEnable=true",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "SELECT c_name FROM customer",
+        },
+        headers={
+            X_WREN_VARIABLE_PREFIX + "session_user": "'Customer#000000001'",
+        },
+    )
+    assert response1.status_code == 200
+    assert response1.headers["X-Cache-Hit"] == "false"  # Cache miss on first request
+    result1 = response1.json()
+    assert len(result1["data"]) == 1
+    assert result1["data"][0][0] == "Customer#000000001"
+
+    # Second request with same session_user - should hit cache
+    response2 = await client.post(
+        url=f"{base_url}/query?cacheEnable=true",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "SELECT c_name FROM customer",
+        },
+        headers={
+            X_WREN_VARIABLE_PREFIX + "session_user": "'Customer#000000001'",
+        },
+    )
+    assert response2.status_code == 200
+    assert response2.headers["X-Cache-Hit"] == "true"  # Should hit cache
+    result2 = response2.json()
+    assert result1["data"] == result2["data"]
+
+    # Third request with different session_user - should miss cache and create new entry
+    response3 = await client.post(
+        url=f"{base_url}/query?cacheEnable=true",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "SELECT c_name FROM customer",
+        },
+        headers={
+            X_WREN_VARIABLE_PREFIX + "session_user": "'Customer#000000002'",
+        },
+    )
+    assert response3.status_code == 200
+    assert (
+        response3.headers["X-Cache-Hit"] == "false"
+    )  # Should miss cache due to different header
+    result3 = response3.json()
+    # Results should be different due to row-level access control
+    assert result1["data"] != result3["data"] if len(result3["data"]) > 0 else True
+
+
+async def test_cache_with_different_session_levels(
+    client, manifest_str, connection_info
+):
+    # First request with session_level = 1
+    response1 = await client.post(
+        url=f"{base_url}/query?cacheEnable=true",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "SELECT * FROM customer LIMIT 1",
+        },
+        headers={
+            X_WREN_VARIABLE_PREFIX + "session_level": "1",
+        },
+    )
+    assert response1.status_code == 200
+    assert response1.headers["X-Cache-Hit"] == "false"
+    result1 = response1.json()
+    assert len(result1["data"][0]) == 3  # Should show c_name column
+
+    # Second request with same session_level - should hit cache
+    response2 = await client.post(
+        url=f"{base_url}/query?cacheEnable=true",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "SELECT * FROM customer LIMIT 1",
+        },
+        headers={
+            X_WREN_VARIABLE_PREFIX + "session_level": "1",
+        },
+    )
+    assert response2.status_code == 200
+    assert response2.headers["X-Cache-Hit"] == "true"
+    assert result1["data"] == response2.json()["data"]
+
+    # Third request with different session_level - should miss cache
+    response3 = await client.post(
+        url=f"{base_url}/query?cacheEnable=true",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "SELECT * FROM customer LIMIT 1",
+        },
+        headers={
+            X_WREN_VARIABLE_PREFIX + "session_level": "2",
+        },
+    )
+    assert response3.status_code == 200
+    assert (
+        response3.headers["X-Cache-Hit"] == "false"
+    )  # Different header should miss cache
+    result3 = response3.json()
+    assert len(result3["data"][0]) == 2  # Should hide c_name column
+
+
+async def test_cache_with_timeout_headers(client, manifest_str, connection_info):
+    # First request with timeout = 30
+    response1 = await client.post(
+        url=f"{base_url}/query?cacheEnable=true",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "SELECT * FROM orders LIMIT 1",
+        },
+        headers={
+            X_WREN_DB_STATEMENT_TIMEOUT: "30",
+        },
+    )
+    assert response1.status_code == 200
+    assert response1.headers["X-Cache-Hit"] == "false"
+
+    # Second request with same timeout - should hit cache
+    response2 = await client.post(
+        url=f"{base_url}/query?cacheEnable=true",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "SELECT * FROM orders LIMIT 1",
+        },
+        headers={
+            X_WREN_DB_STATEMENT_TIMEOUT: "30",
+        },
+    )
+    assert response2.status_code == 200
+    assert response2.headers["X-Cache-Hit"] == "true"
+
+    # Third request with different timeout - should miss cache
+    response3 = await client.post(
+        url=f"{base_url}/query?cacheEnable=true",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "SELECT * FROM orders LIMIT 1",
+        },
+        headers={
+            X_WREN_DB_STATEMENT_TIMEOUT: "60",
+        },
+    )
+    assert response3.status_code == 200
+    assert (
+        response3.headers["X-Cache-Hit"] == "false"
+    )  # Different timeout should miss cache
+
+
+async def test_cache_ignores_irrelevant_headers(client, manifest_str, connection_info):
+    # First request with user-agent header
+    response1 = await client.post(
+        url=f"{base_url}/query?cacheEnable=true",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "SELECT * FROM orders LIMIT 1",
+        },
+        headers={
+            "User-Agent": "TestClient/1.0",
+            "X-Request-ID": "request-123",
+        },
+    )
+    assert response1.status_code == 200
+    assert response1.headers["X-Cache-Hit"] == "false"
+
+    # Second request with different irrelevant headers - should still hit cache
+    response2 = await client.post(
+        url=f"{base_url}/query?cacheEnable=true",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "SELECT * FROM orders LIMIT 1",
+        },
+        headers={
+            "User-Agent": "TestClient/2.0",
+            "X-Request-ID": "request-456",
+            "Accept": "application/json",
+        },
+    )
+    assert response2.status_code == 200
+    assert (
+        response2.headers["X-Cache-Hit"] == "true"
+    )  # Should hit cache despite different irrelevant headers
+
+
+async def test_cache_with_multiple_wren_variables(
+    client, manifest_str, connection_info
+):
+    # First request with multiple variables
+    response1 = await client.post(
+        url=f"{base_url}/query?cacheEnable=true",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "SELECT * FROM customer LIMIT 1",
+        },
+        headers={
+            X_WREN_VARIABLE_PREFIX + "session_user": "'Customer#000000001'",
+            X_WREN_VARIABLE_PREFIX + "session_level": "1",
+        },
+    )
+    assert response1.status_code == 200
+    assert response1.headers["X-Cache-Hit"] == "false"
+
+    # Second request with same variables - should hit cache
+    response2 = await client.post(
+        url=f"{base_url}/query?cacheEnable=true",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "SELECT * FROM customer LIMIT 1",
+        },
+        headers={
+            X_WREN_VARIABLE_PREFIX + "session_user": "'Customer#000000001'",
+            X_WREN_VARIABLE_PREFIX + "session_level": "1",
+        },
+    )
+    assert response2.status_code == 200
+    assert response2.headers["X-Cache-Hit"] == "true"
+
+    # Third request with one variable changed - should miss cache
+    response3 = await client.post(
+        url=f"{base_url}/query?cacheEnable=true",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "SELECT * FROM customer LIMIT 1",
+        },
+        headers={
+            X_WREN_VARIABLE_PREFIX
+            + "session_user": "'Customer#000000002'",  # Changed this value
+            X_WREN_VARIABLE_PREFIX + "session_level": "1",
+        },
+    )
+    assert response3.status_code == 200
+    assert response3.headers["X-Cache-Hit"] == "false"
+
+    # Fourth request with variables in different order - should still hit cache for first combo
+    response4 = await client.post(
+        url=f"{base_url}/query?cacheEnable=true",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "SELECT * FROM customer LIMIT 1",
+        },
+        headers={
+            X_WREN_VARIABLE_PREFIX + "session_level": "1",  # Different order
+            X_WREN_VARIABLE_PREFIX + "session_user": "'Customer#000000001'",
+        },
+    )
+    assert response4.status_code == 200
+    assert (
+        response4.headers["X-Cache-Hit"] == "true"
+    )  # Should hit cache despite different header order
+
+
+async def test_cache_with_mixed_relevant_irrelevant_headers(
+    client, manifest_str, connection_info
+):
+    # First request
+    response1 = await client.post(
+        url=f"{base_url}/query?cacheEnable=true",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "SELECT * FROM orders LIMIT 1",
+        },
+        headers={
+            X_WREN_VARIABLE_PREFIX + "session_level": "1",  # Relevant
+            "User-Agent": "TestClient/1.0",  # Irrelevant
+            X_WREN_DB_STATEMENT_TIMEOUT: "30",  # Relevant
+            "X-Request-ID": "abc123",  # Irrelevant
+        },
+    )
+    assert response1.status_code == 200
+    assert response1.headers["X-Cache-Hit"] == "false"
+
+    # Second request - change irrelevant headers, keep relevant ones same
+    response2 = await client.post(
+        url=f"{base_url}/query?cacheEnable=true",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "SELECT * FROM orders LIMIT 1",
+        },
+        headers={
+            X_WREN_VARIABLE_PREFIX + "session_level": "1",  # Same
+            "User-Agent": "DifferentClient/2.0",  # Changed but irrelevant
+            X_WREN_DB_STATEMENT_TIMEOUT: "30",  # Same
+            "X-Request-ID": "xyz789",  # Changed but irrelevant
+            "Accept": "application/json",  # New but irrelevant
+        },
+    )
+    assert response2.status_code == 200
+    assert response2.headers["X-Cache-Hit"] == "true"  # Should hit cache
+
+    # Third request - change one relevant header
+    response3 = await client.post(
+        url=f"{base_url}/query?cacheEnable=true",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "SELECT * FROM orders LIMIT 1",
+        },
+        headers={
+            X_WREN_VARIABLE_PREFIX + "session_level": "2",  # Changed (relevant)
+            "User-Agent": "TestClient/1.0",  # Back to original
+            X_WREN_DB_STATEMENT_TIMEOUT: "30",  # Same
+            "X-Request-ID": "abc123",  # Back to original
+        },
+    )
+    assert response3.status_code == 200
+    assert (
+        response3.headers["X-Cache-Hit"] == "false"
+    )  # Should miss cache due to changed relevant header

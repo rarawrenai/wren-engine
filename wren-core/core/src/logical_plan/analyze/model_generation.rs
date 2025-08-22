@@ -97,12 +97,14 @@ impl ModelGenerationRule {
                     let rls_filter = filters
                         .into_iter()
                         .reduce(|acc, filter| {
-                            if acc.is_none() {
-                                filter
-                            } else if let Some(filter) = filter {
-                                Some(acc.unwrap().and(filter))
+                            if let Some(acc) = acc {
+                                if let Some(filter) = filter {
+                                    Some(acc.and(filter))
+                                } else {
+                                    Some(acc)
+                                }
                             } else {
-                                acc
+                                filter
                             }
                         })
                         .flatten();
@@ -115,8 +117,9 @@ impl ModelGenerationRule {
                     // The filter should be on on the top of the model plan
                     // and the model plan should be another subquery alias
                     if let Some(filter) = rls_filter {
-                        builder =
-                            builder.alias(model_plan.plan_name())?.filter(filter)?;
+                        builder = builder
+                            .alias(quoted(model_plan.plan_name()))?
+                            .filter(filter)?;
                         // Following the DataFusion planning behavior, we need to
                         // add a projection behind the filter to ensure the unparsing is correct.
                         let indices = 0..builder.schema().fields().len();
@@ -231,7 +234,7 @@ impl ModelGenerationRule {
                             .build()?;
                         Ok(Transformed::yes(alias))
                     } else {
-                        return plan_err!("measures should have an alias");
+                        plan_err!("measures should have an alias")
                     }
                 } else if let Some(partial_model) = extension
                     .node
@@ -271,7 +274,7 @@ impl ModelGenerationRule {
         model: Arc<Model>,
         rule: &RowLevelAccessControl,
     ) -> Result<Option<Expr>> {
-        if validate_rule(&rule.required_properties, &self.properties)? {
+        if validate_rule(&rule.name, &rule.required_properties, &self.properties)? {
             let filter = build_filter_expression(
                 &self.session_state,
                 model,
